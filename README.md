@@ -73,6 +73,23 @@ pieces together on top of the course's join-operator builders.
   batching or backpressure; it relies on the channel abstraction being reliable and ordered.
 - **Replication copies.** The replication distribution clones the record once per peer.
 
+## Performance
+
+Measured locally on an **Intel Core i5-12450H (8 cores / 12 threads), 16 GB RAM, Windows 11**,
+`cargo --release`, single run, synthetic data. Indicative numbers, not a controlled suite.
+
+Setup: 100,000 rows, 10,000 distinct values, 1,000 range queries of width 100 (~1% selectivity,
+1,011 rows per query).
+
+| Index | Build | Query | Memory (by layout) |
+|---|---|---|---|
+| Naive | 145 ms | 1,908 µs | 10,000 × 12.5 KB ≈ **125 MB** |
+| Range-encoded | 354 ms | 227 µs | 10,000 × 12.5 KB ≈ **125 MB** |
+| Decomposed (base 10) | 12 ms | 76 µs | 4 digits × 10 × 12.5 KB ≈ **0.5 MB** |
+
+The decomposed index is ~25× faster per query and ~250× smaller than the naive one here; the
+range-encoded index trades a 2.4× slower build for an 8.4× faster query than naive.
+
 ## Files
 
 | Path | Contents |
