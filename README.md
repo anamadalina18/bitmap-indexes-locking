@@ -76,7 +76,9 @@ pieces together on top of the course's join-operator builders.
 ## Performance
 
 Measured locally on an **Intel Core i5-12450H (8 cores / 12 threads), 16 GB RAM, Windows 11**,
-`cargo --release`, single run, synthetic data. Indicative numbers, not a controlled suite.
+`cargo --release`, single run, synthetic data. The benchmark file shipped with the course skeleton is
+a stub that the course runner replaces, so these figures come from a local harness I wrote, not from
+the course benchmark. Indicative numbers, not a controlled suite.
 
 Setup: 100,000 rows, 10,000 distinct values, 1,000 range queries of width 100 (~1% selectivity,
 1,011 rows per query).
