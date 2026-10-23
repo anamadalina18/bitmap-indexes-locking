@@ -8,39 +8,70 @@ operators, in Rust.
 skeleton: the index and locking traits, the network abstraction, the test suite and the CI pipeline.
 This repository contains **only the files I implemented**, so it does not build standalone.
 
-## What I implemented
+## Architecture
 
-**Bitmap indexes (`src/index/`)**
+### Bitmap indexes
 
-- `NaiveBitmapIndex` — one bitmap per distinct value in a `HashMap<Value, Vec<u8>>`; a range query
-  ORs the bitmaps of all values inside the range.
-- `RangeEncodedBitmapIndex` — values are kept in a `BTreeMap` and each bitmap encodes
-  "value ≤ key" by OR-ing it with the bitmap of the next larger value (computed in reverse order);
-  a range query then combines the encoded bitmap of the upper bound with the one of the lower bound
-  instead of OR-ing every value inside the range.
-- `DecomposedBitmapIndex` — one bitmap per digit of the value in a configurable base (the number of
-  digit positions is derived from the maximum value); a range query evaluates the per-digit
-  constraints and only materializes the rows that can match.
-- `IndexIterator` — turns a bitmap into ascending `RowID`s, skipping all-zero bytes instead of
-  testing every bit.
+All three indexes answer the same `range_lookup(start, end) -> IndexIterator` question and differ
+only in how the bitmaps are laid out:
 
-**Locking (`src/locking/`)**
+| Index | Layout | Range query |
+|---|---|---|
+| Naive | one bitmap per distinct value in a `HashMap<Value, Vec<u8>>` | OR the bitmaps of every value inside the range |
+| Range-encoded | `BTreeMap<Value, bitmap>`, each bitmap = "value ≤ key", built by OR-ing backwards | combine the encoded bitmap of the upper bound with the one of the lower bound |
+| Decomposed | one bitmap per digit of the value in a configurable base | evaluate the digit constraints and materialize only matching rows |
 
-- `BasicLockTable` — per-`RowID` lock state in a `HashMap`: multiple shared readers, one exclusive
-  writer, shared→exclusive upgrade only when the caller is the sole reader, a FIFO queue for
-  denied requests, and `release` returning the requests that become grantable.
-- `MultiGranularityLockTree` — hierarchical locking along a path (IS/IX/S/X style intentions):
-  traverses the tree, checks each level's lock mode against the requested one, aborts and releases
-  the partially acquired path on the first conflict, and releases recursively.
+Rows are numbered by their position in the table scan, so bitmap bit `i` corresponds to row `i`. The
+decomposed index derives the number of digit positions from the maximum value, which means its memory
+is `digits * base * n/8` bytes.
 
-**Distributed operators (`src/dist_operator/`)**
+`IndexIterator` converts a bitmap into ascending `RowID`s by skipping all-zero bytes wholesale and
+walking the set bits of the remaining ones, so iteration cost is proportional to the number of
+results, not to the table size.
 
-- Distribution functions: hash repartitioning on the join key (`key mod peers`) and full replication.
-- `Exchange` — sends tuples to the peers selected by the distribution function and interleaves
-  locally-produced records with messages received from other peers, always draining local data first
-  so the pipeline is not stalled by the network.
-- Join constructors for symmetric repartitioning, asymmetric repartitioning, replication and
-  semi-join reduction, built on the course's join-operator builders.
+### Lock manager
+
+`BasicLockTable` keeps one `BasicLockState` per `RowID`:
+
+```
+readers: Set<TID>   writer: Option<TID>   queue: VecDeque<(TID, LockRequest)>
+```
+
+`lock` grants a shared lock when there is no writer, grants exclusive when there are no readers, and
+allows a **shared → exclusive upgrade only when the caller is the sole reader**. Anything else is
+queued. `release` drops the caller's lock and then drains the queue in FIFO order, granting every
+request that is now compatible.
+
+`MultiGranularityLockTree` implements the hierarchical protocol along a path: ancestors take
+intention locks (`IR`/`IW`), the last node takes `R`/`W`, and each request is checked against the
+conflict matrix of the node it targets. On the first conflict the traversal aborts and the whole
+transaction is rolled back (`release(tid)` removes all its locks recursively).
+
+### Distributed operators
+
+`create_repartitioning_distribution` hashes the join key modulo the peer count (handling negative
+values), and `create_replication_distribution` sends a record to every peer. The `Exchange` operator
+pulls from its child, forwards each record to the peers selected by the distribution function, and
+returns it locally when the current node is among the targets — so local data is never delayed behind
+the network. When the child is exhausted it closes the send side and falls back to receiving. The
+join constructors (symmetric/asymmetric repartitioning, replication, semi-join reduction) wire these
+pieces together on top of the course's join-operator builders.
+
+## Limitations
+
+- **Immutable indexes.** Every index is built once by streaming the table and is never updated; any
+  change to the table requires a full rebuild.
+- **Memory cost.** The naive index stores one full bitmap per distinct value, and the decomposed one
+  multiplies that by the number of digits; only the range-encoded variant is compact.
+- **No deadlock detection.** Denied requests are queued with no timeout and no wait-die/wound-wait
+  ordering, so two conflicting lock orders can deadlock silently.
+- **Upgrades are limited.** A shared lock can only be promoted when the transaction is the sole
+  reader; otherwise the caller must release and retry.
+- **All-or-nothing multi-granularity locking.** A conflict anywhere on the path releases *all* locks
+  of that TID, not just the partially acquired path, so the caller has to restart the transaction.
+- **Single-threaded exchange.** The operator processes one record per `next()` call and does no
+  batching or backpressure; it relies on the channel abstraction being reliable and ordered.
+- **Replication copies.** The replication distribution clones the record once per peer.
 
 ## Files
 
